@@ -1,0 +1,80 @@
+{
+    "name": "atannex/billing",
+    "description": "Payments for Laravel across Stripe, MTN Mobile Money, Orange Money, PayPal and Flutterwave: one fluent API, smart gateway routing by currency and phone operator, a guarded payment state machine, verified webhooks, automatic reconciliation of mobile-money payments, refunds, an audit ledger and a test fake.",
+    "keywords": [
+        "laravel",
+        "payments",
+        "billing",
+        "stripe",
+        "mtn",
+        "momo",
+        "mobile-money",
+        "orange-money",
+        "paypal",
+        "flutterwave",
+        "cameroon",
+        "xaf",
+        "webhooks"
+    ],
+    "type": "library",
+    "license": "MIT",
+    "authors": [
+        {
+            "name": "Atanga Leke Collins",
+            "email": "atangageihlekecollins@gmail.com"
+        }
+    ],
+    "require": {
+        "php": "^8.2",
+        "guzzlehttp/guzzle": "^7.8",
+        "illuminate/cache": "^11.0|^12.0",
+        "illuminate/console": "^11.0|^12.0",
+        "illuminate/database": "^11.0|^12.0",
+        "illuminate/events": "^11.0|^12.0",
+        "illuminate/http": "^11.0|^12.0",
+        "illuminate/queue": "^11.0|^12.0",
+        "illuminate/routing": "^11.0|^12.0",
+        "illuminate/support": "^11.0|^12.0"
+    },
+    "require-dev": {
+        "orchestra/testbench": "^9.0|^10.0",
+        "phpunit/phpunit": "^11.5"
+    },
+    "suggest": {
+        "ext-intl": "Locale-aware money formatting (Money::format())."
+    },
+    "autoload": {
+        "psr-4": {
+            "Atannex\\Billing\\": "src/"
+        },
+        "files": [
+            "src/helpers.php"
+        ]
+    },
+    "autoload-dev": {
+        "psr-4": {
+            "Atannex\\Billing\\Tests\\": "tests/"
+        }
+    },
+    "extra": {
+        "laravel": {
+            "providers": [
+                "Atannex\\Billing\\BillingServiceProvider"
+            ],
+            "aliases": {
+                "Billing": "Atannex\\Billing\\Facades\\Billing"
+            }
+        },
+        "branch-alias": {
+            "dev-main": "1.x-dev"
+        }
+    },
+    "scripts": {
+        "test": "phpunit"
+    },
+    "config": {
+        "sort-packages": true
+    },
+    "minimum-stability": "stable",
+    "prefer-stable": true
+}
