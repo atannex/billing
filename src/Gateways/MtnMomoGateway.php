@@ -4,6 +4,7 @@ declare(strict_types=1);
 
 namespace Atannex\Billing\Gateways;
 
+use Atannex\Billing\Contracts\PreparesRefunds;
 use Atannex\Billing\Data\RefundResult;
 use Atannex\Billing\Data\Snapshot;
 use Atannex\Billing\Data\WebhookEvent;
@@ -26,7 +27,7 @@ use Illuminate\Support\Str;
  * MTN's callbacks are unsigned, so they only trigger a status check.
  * Refunds use the Disbursement product when its keys are configured.
  */
-class MtnMomoGateway extends AbstractGateway
+class MtnMomoGateway extends AbstractGateway implements PreparesRefunds
 {
     protected array $capabilities = [Capability::Push, Capability::Webhooks];
 
@@ -98,13 +99,19 @@ class MtnMomoGateway extends AbstractGateway
         return $this->mapTransfer($body, $payment);
     }
 
+    /** The disbursement X-Reference-Id is ours too: stored before the call. */
+    public function prepareRefund(Payment $payment, Refund $refund): array
+    {
+        return $this->disbursementConfigured() ? ['reference_id' => (string) Str::uuid()] : [];
+    }
+
     public function refund(Payment $payment, Refund $refund): RefundResult
     {
         if (! $this->disbursementConfigured()) {
             return parent::refund($payment, $refund);
         }
 
-        $referenceId = (string) Str::uuid();
+        $referenceId = (string) (data_get($refund->gateway_data ?? [], 'reference_id') ?? $refund->provider_reference ?? Str::uuid());
 
         $this->disbursement(fn (PendingRequest $http) => $http
             ->withHeaders(['X-Reference-Id' => $referenceId])
@@ -122,7 +129,21 @@ class MtnMomoGateway extends AbstractGateway
 
     public function fetchRefund(Payment $payment, Refund $refund): RefundResult
     {
-        $body = (array) $this->disbursement(fn (PendingRequest $http) => $http->get('/disbursement/v1_0/refund/'.$refund->provider_reference))->json();
+        $referenceId = (string) (data_get($refund->gateway_data ?? [], 'reference_id') ?? $refund->provider_reference);
+
+        try {
+            $body = (array) $this->disbursement(fn (PendingRequest $http) => $http->get('/disbursement/v1_0/refund/'.$referenceId))->json();
+        } catch (GatewayException $e) {
+            // MTN never registered the refund (the request was lost). Give a
+            // just-timed-out request time to show up before freeing the amount.
+            if ($e->httpStatus === 404) {
+                return $refund->created_at->lt(now()->subMinutes(10))
+                    ? new RefundResult(RefundStatus::Failed, $referenceId, 'MTN has no record of this refund.')
+                    : new RefundResult(RefundStatus::Pending, $referenceId);
+            }
+
+            throw $e;
+        }
 
         return new RefundResult(
             match (strtoupper((string) ($body['status'] ?? ''))) {
@@ -130,7 +151,7 @@ class MtnMomoGateway extends AbstractGateway
                 'FAILED', 'REJECTED' => RefundStatus::Failed,
                 default => RefundStatus::Pending,
             },
-            $refund->provider_reference,
+            $referenceId,
             $this->reasonText($body['reason'] ?? null),
             raw: $body,
         );

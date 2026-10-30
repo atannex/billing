@@ -133,7 +133,7 @@ class StripeTest extends TestCase
     public function it_refunds_part_of_a_payment_then_the_rest(): void
     {
         $payment = $this->checkoutSession();
-        Billing::processor()->apply($payment, new Snapshot(PaymentStatus::Succeeded, data: ['payment_intent' => 'pi_1']), 'test');
+        Billing::processor()->apply($payment, new Snapshot(PaymentStatus::Succeeded, amount: $payment->money(), data: ['payment_intent' => 'pi_1']), 'test');
         Event::fake([PaymentRefunded::class]);
 
         Http::fake(['api.stripe.com/v1/refunds' => Http::sequence()
@@ -161,7 +161,7 @@ class StripeTest extends TestCase
     public function it_cannot_refund_more_than_was_paid(): void
     {
         $payment = $this->checkoutSession();
-        Billing::processor()->apply($payment, new Snapshot(PaymentStatus::Succeeded), 'test');
+        Billing::processor()->apply($payment, new Snapshot(PaymentStatus::Succeeded, amount: $payment->money()), 'test');
 
         $this->expectException(RefundNotAllowed::class);
 

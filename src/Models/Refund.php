@@ -31,7 +31,8 @@ class Refund extends Model
 
     protected const BASE_TABLE = 'refunds';
 
-    protected $guarded = ['id'];
+    /** Written by the PaymentProcessor only (forceFill). */
+    protected $guarded = ['id', 'payment_id', 'amount', 'currency', 'status', 'provider_reference', 'gateway_data', 'failure_message', 'refunded_at'];
 
     protected $hidden = ['gateway_data'];
 

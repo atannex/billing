@@ -12,7 +12,7 @@ use Illuminate\Contracts\Queue\ShouldQueue;
 use Illuminate\Queue\InteractsWithQueue;
 
 /**
- * Checks one open payment with its provider.
+ * Checks one open (or locally closed, still watched) payment with its provider.
  */
 class ReconcilePayment implements ShouldBeUnique, ShouldQueue
 {
@@ -34,7 +34,7 @@ class ReconcilePayment implements ShouldBeUnique, ShouldQueue
     {
         $payment = Payment::query()->find($this->paymentId);
 
-        if ($payment !== null && $payment->isOpen()) {
+        if ($payment !== null && ($payment->isOpen() || $payment->failed())) {
             $processor->refresh($payment, 'reconcile');
         }
     }

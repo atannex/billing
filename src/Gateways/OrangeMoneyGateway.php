@@ -25,7 +25,9 @@ use Illuminate\Support\Str;
  *   Orange page; Orange notifies notif_url with a notif_token that must
  *   match the one issued for the payment.
  * - merchant: Orange Cameroon's merchant payment API (mp/init + mp/pay).
- *   A USSD prompt is pushed to the payer's phone, like MTN.
+ *   A USSD prompt is pushed to the payer's phone, like MTN. mp/init runs
+ *   in prepare(), so the payToken is stored before the prompt is pushed
+ *   and a timed-out mp/pay is checked rather than failed.
  *
  * Either way a notification only triggers a status check with Orange.
  */
@@ -36,6 +38,16 @@ class OrangeMoneyGateway extends AbstractGateway
         return $this->merchantMode()
             ? [Capability::Push, Capability::Webhooks]
             : [Capability::Redirect, Capability::Webhooks];
+    }
+
+    /** Merchant mode: the payToken from mp/init, kept before mp/pay is sent. */
+    public function prepare(Payment $payment): array
+    {
+        if (! $this->merchantMode() || $payment->msisdn() === null) {
+            return [];
+        }
+
+        return ['pay_token' => $this->initToken()];
     }
 
     public function initiate(Payment $payment): Snapshot
@@ -118,7 +130,7 @@ class OrangeMoneyGateway extends AbstractGateway
         ]))->json();
 
         // Orange keys the lookup by amount, so a SUCCESS here is for this amount.
-        return $this->map((string) ($body['status'] ?? ''), $body, $payment->money());
+        return $this->map((string) ($body['status'] ?? ''), $body, null, amountImplied: true);
     }
 
     private function webpayPath(string $endpoint): string
@@ -161,12 +173,7 @@ class OrangeMoneyGateway extends AbstractGateway
             return Snapshot::failed('invalid_phone', 'A valid Orange Money number is required.');
         }
 
-        $init = (array) $this->merchantCall(fn (PendingRequest $http) => $http->post($this->merchantPath('mp/init')))->json();
-        $payToken = (string) (data_get($init, 'data.payToken') ?? '');
-
-        if ($payToken === '') {
-            throw new GatewayException("[{$this->name}] no payToken in the answer: ".($init['message'] ?? 'unknown error'), $this->name, body: $init);
-        }
+        $payToken = (string) ($payment->gatewayValue('pay_token') ?? $this->initToken());
 
         $body = (array) $this->merchantCall(fn (PendingRequest $http) => $http->post($this->merchantPath('mp/pay'), [
             'notifUrl' => Urls::webhook($this->name, $payment),
@@ -189,6 +196,18 @@ class OrangeMoneyGateway extends AbstractGateway
             data: ['pay_token' => $payToken],
             raw: $body,
         );
+    }
+
+    private function initToken(): string
+    {
+        $init = (array) $this->merchantCall(fn (PendingRequest $http) => $http->post($this->merchantPath('mp/init')))->json();
+        $payToken = (string) (data_get($init, 'data.payToken') ?? '');
+
+        if ($payToken === '') {
+            throw new GatewayException("[{$this->name}] no payToken in the answer: ".($init['message'] ?? 'unknown error'), $this->name, body: $init);
+        }
+
+        return $payToken;
     }
 
     private function fetchMerchant(Payment $payment): Snapshot
@@ -261,7 +280,7 @@ class OrangeMoneyGateway extends AbstractGateway
     /**
      * @param  array<string, mixed>  $raw
      */
-    private function map(string $status, array $raw, ?Money $amount): Snapshot
+    private function map(string $status, array $raw, ?Money $amount, bool $amountImplied = false): Snapshot
     {
         $status = match (strtoupper($status)) {
             'SUCCESS', 'SUCCESSFUL', 'SUCCESSFULL' => PaymentStatus::Succeeded,
@@ -281,6 +300,7 @@ class OrangeMoneyGateway extends AbstractGateway
             failureMessage: $status->isUnsuccessful() && is_string($message) ? $message : null,
             data: array_filter(['txnid' => $raw['txnid'] ?? data_get($raw, 'data.txnid')]),
             raw: $raw,
+            amountImplied: $status === PaymentStatus::Succeeded && $amountImplied,
         );
     }
 }

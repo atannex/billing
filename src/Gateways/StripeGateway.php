@@ -80,7 +80,28 @@ class StripeGateway extends AbstractGateway
 
     public function fetchRefund(Payment $payment, Refund $refund): RefundResult
     {
-        return $this->mapRefund($this->get('/v1/refunds/'.$refund->provider_reference));
+        if ($refund->provider_reference !== null) {
+            return $this->mapRefund($this->get('/v1/refunds/'.$refund->provider_reference));
+        }
+
+        // The create request never answered: find it by our reference.
+        $intent = $payment->gatewayValue('payment_intent');
+
+        if (! is_string($intent) || $intent === '') {
+            return new RefundResult(RefundStatus::Pending);
+        }
+
+        $found = collect((array) ($this->get('/v1/refunds?'.http_build_query(['payment_intent' => $intent, 'limit' => 100]))['data'] ?? []))
+            ->first(fn ($item) => data_get($item, 'metadata.billing_refund') === $refund->reference);
+
+        if (is_array($found)) {
+            return $this->mapRefund($found);
+        }
+
+        // Stripe lists a refund as soon as it exists; an hour on, it never will.
+        return $refund->created_at->lt(now()->subHour())
+            ? new RefundResult(RefundStatus::Failed, failureMessage: 'Stripe has no record of this refund.')
+            : new RefundResult(RefundStatus::Pending);
     }
 
     public function verifyWebhook(Request $request, ?Payment $payment): bool
@@ -159,8 +180,9 @@ class StripeGateway extends AbstractGateway
 
     private function createSession(Payment $payment): Snapshot
     {
-        // Stripe allows a session to stay open between 30 minutes and 24 hours.
-        $minutes = min(1440, max(31, (int) $this->config('expires_after', 1440)));
+        // Stripe allows a session to stay open between 30 minutes and 24
+        // hours, measured on its clock: stay clear of both ends.
+        $minutes = min(1435, max(31, (int) $this->config('expires_after', 1440)));
 
         $body = $this->post('/v1/checkout/sessions', array_filter([
             'mode' => 'payment',

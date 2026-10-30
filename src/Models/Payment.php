@@ -49,7 +49,14 @@ class Payment extends Model
 
     protected const BASE_TABLE = 'payments';
 
-    protected $guarded = ['id'];
+    /**
+     * State only the PaymentProcessor writes (with forceFill), never mass
+     * assignment: the status, the money and what the provider said.
+     */
+    protected $guarded = [
+        'id', 'status', 'gateway', 'amount', 'currency', 'amount_refunded', 'provider_reference', 'gateway_data',
+        'failure_code', 'failure_message', 'checks', 'next_check_at', 'expires_at', 'paid_at', 'failed_at',
+    ];
 
     /** Driver tokens (Orange notif_token, pay_token) never leave the server. */
     protected $hidden = ['gateway_data'];
@@ -192,13 +199,14 @@ class Payment extends Model
     }
 
     /**
-     * Open payments whose next provider check is due.
+     * Payments whose next provider check is due: open ones, and ones closed
+     * locally (expired, cancelled here) still watched for a late success.
      *
      * @param  Builder<self>  $query
      */
     public function scopeDue(Builder $query): void
     {
-        $query->whereIn('status', PaymentStatus::openValues())
+        $query->whereIn('status', [...PaymentStatus::openValues(), PaymentStatus::Failed->value, PaymentStatus::Cancelled->value, PaymentStatus::Expired->value])
             ->whereNotNull('next_check_at')
             ->where('next_check_at', '<=', now());
     }

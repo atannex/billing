@@ -13,7 +13,8 @@ use Illuminate\Console\Command;
 use Throwable;
 
 /**
- * Checks every open payment whose next check is due, and pending refunds.
+ * Checks every open payment whose next check is due (and locally closed
+ * ones still watched for a late success), and pending refunds.
  * Scheduled every minute by the package (reconcile.schedule).
  */
 class ReconcileCommand extends Command
@@ -52,8 +53,9 @@ class ReconcileCommand extends Command
             }
 
             try {
+                $before = $payment->status;
                 $payment = $processor->refresh($payment, 'reconcile');
-                $settled += $payment->isOpen() ? 0 : 1;
+                $settled += $payment->status !== $before && ! $payment->isOpen() ? 1 : 0;
             } catch (Throwable $e) {
                 $failed++;
                 report($e);

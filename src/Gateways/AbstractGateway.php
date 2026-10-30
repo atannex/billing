@@ -14,7 +14,6 @@ use Atannex\Billing\Exceptions\GatewayUnavailable;
 use Atannex\Billing\Exceptions\UnsupportedCapability;
 use Atannex\Billing\Models\Payment;
 use Atannex\Billing\Models\Refund;
-use Atannex\Billing\Money\Currency;
 use Atannex\Billing\Money\Money;
 use Closure;
 use Illuminate\Contracts\Cache\Repository as Cache;
@@ -23,6 +22,7 @@ use Illuminate\Http\Client\Factory as Http;
 use Illuminate\Http\Client\PendingRequest;
 use Illuminate\Http\Client\Response;
 use Illuminate\Http\Request;
+use InvalidArgumentException;
 
 /**
  * Shared plumbing for drivers: configuration, HTTP with one error policy,
@@ -230,6 +230,9 @@ abstract class AbstractGateway implements GatewayContract
 
     /**
      * Money from a provider's major-unit amount, in the payment's terms.
+     * Parsed exactly as a decimal string: "5000.0" and "5000.00" are 5000
+     * XAF, but "5000.5" XAF is no amount at all (null, so never a match)
+     * rather than being rounded into one.
      */
     protected function moneyFromDecimal(int|float|string|null $amount, ?string $providerCurrency, Payment $payment): ?Money
     {
@@ -238,10 +241,17 @@ abstract class AbstractGateway implements GatewayContract
         }
 
         $currency = $this->ownCurrency($providerCurrency, $payment->currency);
-        $decimals = Currency::decimals($currency);
 
-        // Providers send "5000.0" for zero-decimal currencies; round to the unit.
-        return Money::of(number_format((float) $amount, $decimals, '.', ''), $currency);
+        if (is_float($amount)) {
+            // A JSON number: its shortest exact decimal form, not a rounded one.
+            $amount = is_finite($amount) ? rtrim(rtrim(sprintf('%.12F', $amount), '0'), '.') : '';
+        }
+
+        try {
+            return Money::of(is_int($amount) ? $amount : trim($amount), $currency);
+        } catch (InvalidArgumentException) {
+            return null;
+        }
     }
 
     protected function moneyFromMinor(?int $amount, ?string $providerCurrency, Payment $payment): ?Money

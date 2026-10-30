@@ -23,8 +23,11 @@ use Throwable;
  */
 class WebhookController
 {
-    /** Request headers worth keeping with a call (no cookies or credentials). */
-    private const HEADERS = ['content-type', 'user-agent', 'stripe-signature', 'verif-hash', 'paypal-transmission-id', 'paypal-transmission-time', 'x-forwarded-for'];
+    /**
+     * Request headers worth keeping with a call: no cookies or credentials,
+     * and no shared secrets (Flutterwave's verif-hash is the secret itself).
+     */
+    private const HEADERS = ['content-type', 'user-agent', 'stripe-signature', 'paypal-transmission-id', 'paypal-transmission-time', 'x-forwarded-for'];
 
     public function __invoke(Request $request, BillingManager $billing, Dispatcher $events, string $gateway, ?string $reference = null): JsonResponse
     {

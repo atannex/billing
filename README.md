@@ -144,6 +144,8 @@ const poll = setInterval(async () => {
 }, 3000);
 ```
 
+The route's `failure_message` is one of billing's own payer-safe sentences ("The payer declined the payment."), never the provider's raw text; the full reason stays on `$payment->failure_message` for staff.
+
 Hosted pages send the payer back to `GET /billing/return/{reference}`. Billing asks the provider for the status (it never trusts the query string), captures PayPal orders, then redirects to your `returnTo()` URL with `?payment=PAY-…&status=succeeded`.
 
 ### Models
@@ -190,7 +192,7 @@ Billing::refund($payment, 2000, 'Damaged item');    // part, in major units of t
 Billing::refund($payment, Money::of('9.90', 'EUR'));
 ```
 
-Refunds lock the payment and count refunds still in flight, so two concurrent refunds can't exceed the amount paid. Providers that settle refunds later (MTN, sometimes Stripe and PayPal) are followed up by `billing:reconcile` and webhooks. Orange Money has no public refund API, so `refund()` throws `UnsupportedCapability` for it.
+Refunds lock the payment and count refunds still in flight, so two concurrent refunds can't exceed the amount paid. Providers that settle refunds later (MTN, sometimes Stripe and PayPal) are followed up by `billing:reconcile` and webhooks. A refund whose request timed out (or got a 5xx) is not failed, since the provider may have paid it: it stays `pending`, its amount reserved, until reconciliation finds it (MTN by the id stored before the call, Stripe by its metadata); only a refusal (4xx) fails it. Orange Money has no public refund API, so `refund()` throws `UnsupportedCapability` for it.
 
 ## Events
 
@@ -229,7 +231,7 @@ Phone numbers are normalized by `Atannex\Billing\Support\Msisdn` ("677 12 34 56"
 
 ## Reconciliation
 
-Mobile money is asynchronous, and callbacks get lost or arrive late. Each open payment carries `next_check_at` and `expires_at` (from the gateway's `expires_after`). `billing:reconcile` runs every minute and checks due payments on the `reconcile.backoff` schedule, with the last check placed exactly at expiry. A payment still unanswered at expiry becomes `expired`. If the provider later reports success through a callback or a manual refresh, it moves to `succeeded` and the ledger records a `late_success`.
+Mobile money is asynchronous, and callbacks get lost or arrive late. Each open payment carries `next_check_at` and `expires_at` (from the gateway's `expires_after`). `billing:reconcile` runs every minute and checks due payments on the `reconcile.backoff` schedule, with the last check placed exactly at expiry. A payment still open at expiry (on a successful check: a failed check never closes anything) becomes `expired`. A payment closed here rather than by the provider (expired, or cancelled at a gateway that cannot call it off) is still checked every `reconcile.grace_every` seconds for `reconcile.grace` minutes (default 24 hours). If the provider reports success meanwhile, through that check, a callback or a manual refresh, it moves to `succeeded` and the ledger records a `late_success`.
 
 Set `BILLING_QUEUE=payments` to check payments through queued `ReconcilePayment` jobs instead of inline. Set `reconcile.schedule` to `false` if you schedule the command yourself.
 
@@ -251,7 +253,7 @@ $this->assertTrue($order->fresh()->isPaid());
 $fake->assertChargedTimes(1);  $fake->assertNothingCharged();  $fake->assertRefunded();
 ```
 
-For local development without credentials, enable the `fake` gateway (`'enabled' => true`, `'outcome' => 'requires_action'`). Its redirect goes straight to the return page and the payment succeeds.
+For local development without credentials, enable the `fake` gateway (`'enabled' => true`, `'outcome' => 'requires_action'`). Its redirect goes straight to the return page and the payment succeeds. It refuses to run when the app environment is `production` unless `billing.allow_fake_in_production` is true.
 
 ## Writing a driver
 

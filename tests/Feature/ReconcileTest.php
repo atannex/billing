@@ -101,7 +101,7 @@ class ReconcileTest extends TestCase
     public function a_payment_never_sent_is_closed(): void
     {
         Billing::fake();
-        $payment = Payment::query()->create([
+        $payment = Payment::query()->forceCreate([
             'reference' => 'PAY-ORPHAN', 'gateway' => 'stripe', 'status' => 'pending',
             'amount' => 100, 'currency' => 'XAF', 'next_check_at' => now()->addMinutes(5),
         ]);

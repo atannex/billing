@@ -21,6 +21,7 @@ use Atannex\Billing\Testing\BillingFake;
 use Closure;
 use Illuminate\Contracts\Cache\Factory as CacheFactory;
 use Illuminate\Contracts\Container\Container;
+use Illuminate\Contracts\Foundation\Application;
 use Illuminate\Http\Client\Factory as Http;
 use Illuminate\Http\Request;
 
@@ -206,6 +207,11 @@ class BillingManager
         return $payment instanceof Payment ? $payment : $this->findOrFail($payment);
     }
 
+    private function inProduction(): bool
+    {
+        return $this->app instanceof Application && $this->app->environment('production');
+    }
+
     private function build(string $name): Gateway
     {
         $config = $this->gatewayConfig($name);
@@ -221,6 +227,11 @@ class BillingManager
         }
 
         $driver = (string) ($config['driver'] ?? $name);
+
+        // The standalone fake marks payments paid: never by accident in production.
+        if ($driver === 'fake' && ! isset($this->extensions[$driver]) && $this->inProduction() && ! $this->config('allow_fake_in_production', false)) {
+            throw new BillingException("Billing gateway [{$name}] uses the fake driver, which is disabled in production (billing.allow_fake_in_production).");
+        }
 
         if (isset($this->extensions[$driver])) {
             return ($this->extensions[$driver])($name, $config, $this->app);

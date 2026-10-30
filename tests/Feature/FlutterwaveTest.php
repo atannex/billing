@@ -74,7 +74,7 @@ class FlutterwaveTest extends TestCase
     {
         Http::fake([
             'flw.test/v3/payments' => Http::response(['status' => 'success', 'message' => 'Hosted Link', 'data' => ['link' => 'https://checkout.flutterwave.test/v3/hosted/pay/abc']]),
-            'flw.test/v3/transactions/verify_by_reference*' => Http::response(['status' => 'success', 'data' => $transaction]),
+            'flw.test/v3/transactions/verify_by_reference*' => fn (Request $request) => Http::response(['status' => 'success', 'data' => ['tx_ref' => $request['tx_ref'], ...$transaction]]),
         ]);
 
         return Billing::amount(10000)->via('flutterwave')->email('ngozi@example.com')->name('Ngozi')->charge();

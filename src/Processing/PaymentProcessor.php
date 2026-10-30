@@ -5,6 +5,7 @@ declare(strict_types=1);
 namespace Atannex\Billing\Processing;
 
 use Atannex\Billing\BillingManager;
+use Atannex\Billing\Contracts\PreparesRefunds;
 use Atannex\Billing\Data\RefundResult;
 use Atannex\Billing\Data\Snapshot;
 use Atannex\Billing\Enums\Capability;
@@ -18,6 +19,7 @@ use Atannex\Billing\Events\PaymentRequiresAction;
 use Atannex\Billing\Events\PaymentStatusChanged;
 use Atannex\Billing\Events\PaymentSucceeded;
 use Atannex\Billing\Events\RefundFailed;
+use Atannex\Billing\Exceptions\BillingException;
 use Atannex\Billing\Exceptions\GatewayException;
 use Atannex\Billing\Exceptions\GatewayUnavailable;
 use Atannex\Billing\Exceptions\RefundNotAllowed;
@@ -27,6 +29,8 @@ use Atannex\Billing\Models\Refund;
 use Atannex\Billing\Money\Money;
 use Illuminate\Contracts\Events\Dispatcher;
 use Illuminate\Http\Request;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\Log;
 use Illuminate\Support\Str;
 use Throwable;
 
@@ -103,7 +107,9 @@ class PaymentProcessor
 
         $payment = $this->apply($payment, $snapshot, 'api');
 
-        $this->events->dispatch(new PaymentInitiated($payment));
+        // After the commit, like every other event.
+        $this->queue(new PaymentInitiated($payment));
+        $this->flush($payment);
 
         return $payment;
     }
@@ -130,12 +136,17 @@ class PaymentProcessor
                 throw $e;
             }
 
+            // Nothing was learned: keep the status and look again later. A
+            // payment is never expired on a failed check, since the payer
+            // may have approved it in the meantime.
             $this->record($payment, 'check_failed', $source, ['error' => $e->getMessage()]);
-            $snapshot = Snapshot::status($payment->status);
+
+            return $this->checked($payment);
         }
 
         $payment = $this->apply($payment, $snapshot, $source, $counted);
 
+        // Only a successful check that shows the payment still open expires it.
         if ($payment->isOpen() && $payment->expires_at !== null && $payment->expires_at->isPast()) {
             $payment = $this->expire($payment, $source);
         }
@@ -162,11 +173,21 @@ class PaymentProcessor
         }
 
         $gateway = $this->billing->gateway($payment->gateway);
+
+        // Closed only here, the provider may still take the money: keep
+        // checking for a while so a late success lands.
         $snapshot = $gateway->supports(Capability::Cancel) && $payment->provider_reference !== null
             ? $gateway->cancel($payment)
-            : Snapshot::status(PaymentStatus::Cancelled);
+            : new Snapshot(PaymentStatus::Cancelled, data: $this->watch($payment));
 
         return $this->apply($payment, $snapshot, 'api');
+    }
+
+    /** Whether the gateway can call a payment off at the provider. */
+    public function cancellable(Payment $payment): bool
+    {
+        return $payment->provider_reference !== null
+            && $this->billing->gateway($payment->gateway)->supports(Capability::Cancel);
     }
 
     /**
@@ -177,50 +198,16 @@ class PaymentProcessor
     {
         $connection = $payment->getConnection();
 
-        $fresh = $connection->transaction(function () use ($payment, $snapshot, $source, $countCheck) {
-            /** @var Payment $locked */
-            $locked = $payment->newQuery()->lockForUpdate()->findOrFail($payment->getKey());
-            $from = $locked->status;
-            $to = $snapshot->status;
+        // Events queued by a call that rolled back must never reach the next one.
+        $this->pending = [];
 
-            $locked->gateway_data = array_filter([
-                ...($locked->gateway_data ?? []),
-                ...array_filter($snapshot->data, fn ($value) => $value !== null),
-                'redirect_url' => $snapshot->redirectUrl ?? $locked->gatewayValue('redirect_url'),
-                'client_secret' => $snapshot->clientSecret ?? $locked->gatewayValue('client_secret'),
-            ], fn ($value) => $value !== null);
+        try {
+            $fresh = $connection->transaction(fn () => $this->applyLocked($payment, $snapshot, $source, $countCheck));
+        } catch (Throwable $e) {
+            $this->pending = [];
 
-            if ($snapshot->providerReference !== null && $locked->provider_reference === null) {
-                $locked->provider_reference = $snapshot->providerReference;
-            }
-
-            $failureCode = $snapshot->failureCode;
-            $failureMessage = $snapshot->failureMessage;
-
-            // Never mark paid on the provider's word alone if its numbers differ.
-            if ($to === PaymentStatus::Succeeded && $snapshot->amount !== null && ! $snapshot->amount->equals($locked->money())) {
-                $this->queue(new AmountMismatch($locked, $locked->money(), $snapshot->amount));
-                $this->record($locked, 'amount_mismatch', $source, ['expected' => $locked->money(), 'reported' => $snapshot->amount]);
-                $to = PaymentStatus::Failed;
-                $failureCode = 'amount_mismatch';
-                $failureMessage = "The provider reported {$snapshot->amount}, expected {$locked->money()}.";
-            }
-
-            if ($to !== $from && $from->canTransitionTo($to)) {
-                $this->transition($locked, $from, $to, $source, $failureCode, $failureMessage, $snapshot->raw);
-            } elseif ($to !== $from) {
-                $this->record($locked, 'stale', $source, ['reported' => $to->value]);
-            }
-
-            if ($countCheck) {
-                $locked->checks++;
-            }
-
-            $this->schedule($locked);
-            $locked->save();
-
-            return $locked;
-        });
+            throw $e;
+        }
 
         $payment->setRawAttributes($fresh->getAttributes(), true);
         $this->flush($payment);
@@ -262,7 +249,7 @@ class PaymentProcessor
                 throw UnsupportedCapability::for($gateway->name(), Capability::PartialRefunds);
             }
 
-            return $locked->refunds()->create([
+            return $locked->refunds()->forceCreate([
                 'reference' => 'RF-'.strtoupper((string) Str::ulid()),
                 'amount' => $amount->amount,
                 'currency' => $amount->currency,
@@ -271,10 +258,32 @@ class PaymentProcessor
             ]);
         });
 
+        // Ids the driver chooses itself are stored before the call, so a
+        // refund whose request timed out can still be looked up (MTN).
+        if ($gateway instanceof PreparesRefunds && ($prepared = $gateway->prepareRefund($payment, $refund)) !== []) {
+            $refund->forceFill([
+                'gateway_data' => [...($refund->gateway_data ?? []), ...$prepared],
+                'provider_reference' => $refund->provider_reference ?? ($prepared['reference_id'] ?? null),
+            ])->save();
+        }
+
         try {
             $result = $gateway->refund($payment, $refund);
-        } catch (Throwable $e) {
+        } catch (GatewayUnavailable $e) {
+            // Timeout or 5xx: the provider may have sent the money. The
+            // refund stays pending, its amount reserved, until reconciliation
+            // learns the outcome; failing it here could refund twice.
+            $this->record($payment, 'refund_unconfirmed', 'api', ['refund' => $refund->reference, 'error' => $e->getMessage()]);
+
+            return $refund;
+        } catch (BillingException $e) {
+            // The provider refused it (4xx) or it was never sent.
             $this->applyRefund($refund, new RefundResult(RefundStatus::Failed, failureMessage: Str::limit($e->getMessage(), 250)), 'api');
+
+            throw $e;
+        } catch (Throwable $e) {
+            // Unknown outcome: keep the amount reserved.
+            $this->record($payment, 'refund_unconfirmed', 'api', ['refund' => $refund->reference, 'error' => Str::limit($e->getMessage(), 250)]);
 
             throw $e;
         }
@@ -289,51 +298,29 @@ class PaymentProcessor
         }
 
         $payment = $refund->payment;
+        $result = $this->billing->gateway($payment->gateway)->fetchRefund($payment, $refund);
 
-        return $this->applyRefund($refund, $this->billing->gateway($payment->gateway)->fetchRefund($payment, $refund), $source);
+        if ($result->status === RefundStatus::Pending && $refund->provider_reference === null && $result->providerReference === null) {
+            // The request never answered and this driver cannot look the
+            // refund up by our reference: it stays reserved for a person.
+            Log::warning('billing.refund.unresolved', ['refund' => $refund->reference, 'payment' => $payment->reference, 'gateway' => $payment->gateway]);
+        }
+
+        return $this->applyRefund($refund, $result, $source);
     }
 
     public function applyRefund(Refund $refund, RefundResult $result, string $source): Refund
     {
         $payment = $refund->payment;
+        $this->pending = [];
 
-        $payment->getConnection()->transaction(function () use ($payment, $refund, $result, $source) {
-            /** @var Payment $locked */
-            $locked = $payment->newQuery()->lockForUpdate()->findOrFail($payment->getKey());
-            /** @var Refund $current */
-            $current = $refund->newQuery()->findOrFail($refund->getKey());
+        try {
+            $payment->getConnection()->transaction(fn () => $this->applyRefundLocked($payment, $refund, $result, $source));
+        } catch (Throwable $e) {
+            $this->pending = [];
 
-            if ($current->status->isFinal()) {
-                return;
-            }
-
-            $current->fill([
-                'provider_reference' => $current->provider_reference ?? $result->providerReference,
-                'gateway_data' => [...($current->gateway_data ?? []), ...$result->data],
-                'status' => $result->status,
-                'failure_message' => $result->failureMessage,
-                'refunded_at' => $result->status === RefundStatus::Succeeded ? now() : null,
-            ])->save();
-
-            if ($result->status === RefundStatus::Succeeded) {
-                $locked->amount_refunded += $current->amount;
-                $to = $locked->amount_refunded >= $locked->amount ? PaymentStatus::Refunded : PaymentStatus::PartiallyRefunded;
-                $this->record($locked, 'refunded', $source, ['refund' => $current->reference, 'amount' => $current->money()]);
-
-                if ($locked->status->canTransitionTo($to)) {
-                    $this->transition($locked, $locked->status, $to, $source, null, null, $result->raw);
-                }
-
-                $locked->save();
-                $this->queue(new PaymentRefunded($locked, $current));
-            } elseif ($result->status === RefundStatus::Failed) {
-                $this->record($locked, 'refund_failed', $source, ['refund' => $current->reference, 'error' => $result->failureMessage]);
-                $this->queue(new RefundFailed($locked, $current));
-            }
-
-            $refund->setRawAttributes($current->getAttributes(), true);
-            $payment->setRawAttributes($locked->getAttributes(), true);
-        });
+            throw $e;
+        }
 
         $this->flush($payment);
 
@@ -341,6 +328,139 @@ class PaymentProcessor
     }
 
     // Internals ----------------------------------------------------------
+
+    private function applyLocked(Payment $payment, Snapshot $snapshot, string $source, bool $countCheck): Payment
+    {
+        /** @var Payment $locked */
+        $locked = $payment->newQuery()->lockForUpdate()->findOrFail($payment->getKey());
+        $from = $locked->status;
+        $to = $snapshot->status;
+
+        $locked->gateway_data = array_filter([
+            ...($locked->gateway_data ?? []),
+            ...array_filter($snapshot->data, fn ($value) => $value !== null),
+            'redirect_url' => $snapshot->redirectUrl ?? $locked->gatewayValue('redirect_url'),
+            'client_secret' => $snapshot->clientSecret ?? $locked->gatewayValue('client_secret'),
+        ], fn ($value) => $value !== null);
+
+        // The provider itself confirmed a closed payment: stop watching it.
+        if ($from->isUnsuccessful() && $snapshot->status->isUnsuccessful() && ! array_key_exists('watch_until', $snapshot->data)) {
+            $locked->gateway_data = array_diff_key($locked->gateway_data, ['watch_until' => true]) ?: null;
+        }
+
+        if ($snapshot->providerReference !== null && $locked->provider_reference === null) {
+            $locked->provider_reference = $snapshot->providerReference;
+        }
+
+        $failureCode = $snapshot->failureCode;
+        $failureMessage = $snapshot->failureMessage;
+        $reported = $this->reported($locked, $snapshot->amount);
+
+        if ($to === PaymentStatus::Succeeded && $reported === null && ! $snapshot->amountImplied) {
+            // Success without the amount it was for is not proof of payment.
+            $this->record($locked, 'amount_unverified', $source, ['reported' => $snapshot->status->value]);
+            $to = $from->isOpen() ? PaymentStatus::Processing : $from;
+        } elseif ($to === PaymentStatus::Succeeded && $reported !== null && ! $reported->equals($locked->money())) {
+            // Never mark paid on the provider's word alone if its numbers differ.
+            $this->queue(new AmountMismatch($locked, $locked->money(), $reported));
+            $this->record($locked, 'amount_mismatch', $source, ['expected' => $locked->money(), 'reported' => $reported]);
+            $to = PaymentStatus::Failed;
+            $failureCode = 'amount_mismatch';
+            $failureMessage = "The provider reported {$reported}, expected {$locked->money()}.";
+        }
+
+        if ($to !== $from && $from->canTransitionTo($to)) {
+            $this->transition($locked, $from, $to, $source, $failureCode, $failureMessage, $snapshot->raw);
+        } elseif ($to !== $from && ! ($from->isUnsuccessful() && $to->isOpen())) {
+            // (A watched, locally closed payment still pending at the provider is not news.)
+            $this->record($locked, 'stale', $source, ['reported' => $to->value]);
+        }
+
+        if ($countCheck) {
+            $locked->checks++;
+        }
+
+        $this->schedule($locked);
+        $locked->save();
+
+        return $locked;
+    }
+
+    /**
+     * A check that learned nothing: count it and book the next one.
+     */
+    private function checked(Payment $payment): Payment
+    {
+        $fresh = $payment->getConnection()->transaction(function () use ($payment) {
+            /** @var Payment $locked */
+            $locked = $payment->newQuery()->lockForUpdate()->findOrFail($payment->getKey());
+            $locked->checks++;
+            $this->schedule($locked);
+            $locked->save();
+
+            return $locked;
+        });
+
+        $payment->setRawAttributes($fresh->getAttributes(), true);
+
+        return $payment;
+    }
+
+    /**
+     * The provider's amount in the payment's terms: a currency sent through
+     * the gateway's currency_map (XAF → EUR) is read back as the original.
+     */
+    private function reported(Payment $payment, ?Money $amount): ?Money
+    {
+        if ($amount === null || $amount->currency === $payment->currency) {
+            return $amount;
+        }
+
+        $map = (array) ($this->billing->gateway($payment->gateway)->config('currency_map') ?? []);
+        $mapped = strtoupper((string) ($map[strtoupper($payment->currency)] ?? ''));
+
+        return $mapped === $amount->currency ? Money::minor($amount->amount, $payment->currency) : $amount;
+    }
+
+    private function applyRefundLocked(Payment $payment, Refund $refund, RefundResult $result, string $source): void
+    {
+        /** @var Payment $locked */
+        $locked = $payment->newQuery()->lockForUpdate()->findOrFail($payment->getKey());
+        /** @var Refund $current */
+        $current = $refund->newQuery()->findOrFail($refund->getKey());
+
+        if ($current->status->isFinal()) {
+            return;
+        }
+
+        $current->forceFill([
+            'provider_reference' => $current->provider_reference ?? $result->providerReference,
+            'gateway_data' => [...($current->gateway_data ?? []), ...$result->data],
+            'status' => $result->status,
+            'failure_message' => $result->failureMessage,
+            'refunded_at' => $result->status === RefundStatus::Succeeded ? now() : null,
+        ])->save();
+
+        if ($result->status === RefundStatus::Succeeded) {
+            $locked->amount_refunded += $current->amount;
+            $to = $locked->amount_refunded >= $locked->amount ? PaymentStatus::Refunded : PaymentStatus::PartiallyRefunded;
+            $this->record($locked, 'refunded', $source, ['refund' => $current->reference, 'amount' => $current->money()]);
+
+            // A second partial refund changes the amount, not the status.
+            if ($to !== $locked->status && $locked->status->canTransitionTo($to)) {
+                $this->transition($locked, $locked->status, $to, $source, null, null, $result->raw);
+            }
+
+            $locked->save();
+            $this->queue(new PaymentRefunded($locked, $current));
+        } elseif ($result->status === RefundStatus::Failed) {
+            $this->record($locked, 'refund_failed', $source, ['refund' => $current->reference, 'error' => $result->failureMessage]);
+            $this->queue(new RefundFailed($locked, $current));
+        }
+
+        $refund->setRawAttributes($current->getAttributes(), true);
+        $payment->setRawAttributes($locked->getAttributes(), true);
+    }
 
     /**
      * @param  array<string, mixed>  $raw
@@ -380,12 +500,47 @@ class PaymentProcessor
         if ($gateway->supports(Capability::Cancel) && $payment->provider_reference !== null) {
             try {
                 $gateway->cancel($payment);
-            } catch (Throwable) {
-                // Expiring locally is what matters; a late success still lands.
+            } catch (Throwable $e) {
+                // Often the payment completed meanwhile: look again first.
+                $this->record($payment, 'cancel_failed', $source, ['error' => Str::limit($e->getMessage(), 250)]);
+
+                try {
+                    $payment = $this->apply($payment, $gateway->fetch($payment), $source);
+                } catch (Throwable) {
+                    return $payment;     // nothing known; the next check tries again
+                }
+
+                if (! $payment->isOpen()) {
+                    return $payment;
+                }
             }
         }
 
-        return $this->apply($payment, new Snapshot(PaymentStatus::Expired, failureCode: 'expired', failureMessage: 'The payment was not completed in time.'), $source);
+        // Closed here, not by the provider: keep watching for a late success.
+        return $this->apply($payment, new Snapshot(
+            PaymentStatus::Expired,
+            failureCode: 'expired',
+            failureMessage: 'The payment was not completed in time.',
+            data: $this->watch($payment),
+        ), $source);
+    }
+
+    /**
+     * Driver data marking a payment closed locally while the provider may
+     * still complete it: reconciliation keeps checking it, slowly, until
+     * the grace window (reconcile.grace, minutes) runs out.
+     *
+     * @return array<string, int>
+     */
+    private function watch(Payment $payment): array
+    {
+        $grace = (int) ($this->config['reconcile']['grace'] ?? 1440);
+
+        if ($grace <= 0 || ($payment->provider_reference === null && empty($payment->gateway_data))) {
+            return [];
+        }
+
+        return ['watch_until' => now()->addMinutes($grace)->getTimestamp()];
     }
 
     /**
@@ -394,7 +549,17 @@ class PaymentProcessor
     private function schedule(Payment $payment): void
     {
         if (! $payment->status->isOpen()) {
-            $payment->next_check_at = null;
+            $until = $payment->gatewayValue('watch_until');
+            $watched = $payment->status->isUnsuccessful() && is_numeric($until) && (int) $until > now()->getTimestamp();
+
+            if ($watched) {
+                $every = max(60, (int) ($this->config['reconcile']['grace_every'] ?? 900));
+                $next = now()->addSeconds($every);
+                $limit = Carbon::createFromTimestamp((int) $until, $next->getTimezone());
+                $payment->next_check_at = $next->gt($limit) ? $limit : $next;
+            } else {
+                $payment->next_check_at = null;
+            }
 
             return;
         }

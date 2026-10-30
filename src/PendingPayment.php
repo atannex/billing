@@ -212,7 +212,7 @@ class PendingPayment
         }
 
         try {
-            $payment = Payment::query()->create([
+            $payment = Payment::query()->forceCreate([
                 'reference' => $this->billing->config('reference_prefix', 'PAY-').strtoupper((string) Str::ulid()),
                 'gateway' => $gateway,
                 'method' => $this->method,

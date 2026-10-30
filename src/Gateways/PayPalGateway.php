@@ -11,6 +11,7 @@ use Atannex\Billing\Enums\Capability;
 use Atannex\Billing\Enums\PaymentStatus;
 use Atannex\Billing\Enums\RefundStatus;
 use Atannex\Billing\Exceptions\GatewayException;
+use Atannex\Billing\Exceptions\GatewayUnavailable;
 use Atannex\Billing\Models\Payment;
 use Atannex\Billing\Models\Refund;
 use Atannex\Billing\Support\Urls;
@@ -68,7 +69,26 @@ class PayPalGateway extends AbstractGateway
         $order = (array) $this->call(fn (PendingRequest $http) => $http->get('/v2/checkout/orders/'.$payment->provider_reference))->json();
 
         if (($order['status'] ?? null) === 'APPROVED') {
-            $order = $this->capture($payment);
+            try {
+                $order = $this->capture($payment);
+            } catch (GatewayException $e) {
+                if ($e->httpStatus !== 422 || $e instanceof GatewayUnavailable) {
+                    throw $e;
+                }
+
+                // Captured by an earlier attempt whose answer was lost.
+                if ($this->issue($e) === 'ORDER_ALREADY_CAPTURED') {
+                    return $this->mapOrder((array) $this->call(fn (PendingRequest $http) => $http->get('/v2/checkout/orders/'.$payment->provider_reference))->json(), $payment);
+                }
+
+                // INSTRUMENT_DECLINED and the like: a refusal, not an outage.
+                // Retrying the capture would only fail the same way.
+                return Snapshot::failed(
+                    strtolower($this->issue($e) ?? 'capture_refused'),
+                    (string) (data_get($e->body, 'details.0.description') ?? 'PayPal refused to capture the payment.'),
+                    $e->body,
+                );
+            }
         }
 
         return $this->mapOrder($order, $payment);
@@ -95,6 +115,11 @@ class PayPalGateway extends AbstractGateway
 
     public function fetchRefund(Payment $payment, Refund $refund): RefundResult
     {
+        // The refund request never answered; PayPal has no lookup by our id.
+        if ($refund->provider_reference === null) {
+            return new RefundResult(RefundStatus::Pending);
+        }
+
         return $this->mapRefund((array) $this->call(fn (PendingRequest $http) => $http->get('/v2/payments/refunds/'.$refund->provider_reference))->json());
     }
 
@@ -148,6 +173,13 @@ class PayPalGateway extends AbstractGateway
             ),
             default => WebhookEvent::ignored($id, $type),
         };
+    }
+
+    private function issue(GatewayException $e): ?string
+    {
+        $issue = data_get($e->body, 'details.0.issue');
+
+        return is_string($issue) && $issue !== '' ? strtoupper($issue) : null;
     }
 
     /**
@@ -209,7 +241,9 @@ class PayPalGateway extends AbstractGateway
         $redirect = collect((array) ($order['links'] ?? []))->first(fn ($link) => in_array($link['rel'] ?? null, ['payer-action', 'approve'], true));
 
         $status = match ($order['status'] ?? null) {
-            'COMPLETED' => match ($capture['status'] ?? 'COMPLETED') {
+            // No capture in the answer is no proof of payment: check again.
+            'COMPLETED' => match ($capture['status'] ?? null) {
+                null => PaymentStatus::Processing,
                 'COMPLETED' => PaymentStatus::Succeeded,
                 'PENDING' => PaymentStatus::Processing,
                 'REFUNDED', 'PARTIALLY_REFUNDED' => PaymentStatus::Succeeded,

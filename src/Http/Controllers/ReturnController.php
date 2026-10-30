@@ -48,11 +48,16 @@ class ReturnController
 
     /**
      * The payer backed out. A payment that went through anyway still wins.
+     * Only a gateway that can call the payment off at the provider closes
+     * it here; elsewhere the link proves nothing (anyone can open it, and
+     * the prompt may still be live), so the provider decides and the
+     * payment expires on its own if nobody pays.
      */
     private function cancelled(BillingManager $billing, Payment $payment): Payment
     {
-        $payment = $billing->processor()->refresh($payment, 'return');
+        $processor = $billing->processor();
+        $payment = $processor->refresh($payment, 'return');
 
-        return $payment->isOpen() ? $billing->processor()->cancel($payment) : $payment;
+        return $payment->isOpen() && $processor->cancellable($payment) ? $processor->cancel($payment) : $payment;
     }
 }

@@ -11,6 +11,7 @@ use Atannex\Billing\Enums\Capability;
 use Atannex\Billing\Enums\PaymentStatus;
 use Atannex\Billing\Enums\RefundStatus;
 use Atannex\Billing\Exceptions\GatewayException;
+use Atannex\Billing\Exceptions\GatewayUnavailable;
 use Atannex\Billing\Models\Payment;
 use Atannex\Billing\Models\Refund;
 use Atannex\Billing\Support\Urls;
@@ -61,17 +62,31 @@ class FlutterwaveGateway extends AbstractGateway
         return new Snapshot(PaymentStatus::RequiresAction, redirectUrl: $link, raw: $body);
     }
 
+    /**
+     * Verified by transaction id once one is known (Flutterwave's
+     * recommended check), by our tx_ref otherwise. Either way the answer
+     * must concern this payment; its amount and currency are then checked
+     * by the processor.
+     */
     public function fetch(Payment $payment): Snapshot
     {
-        try {
-            $body = $this->call('get', '/v3/transactions/verify_by_reference', ['tx_ref' => $payment->reference]);
-        } catch (GatewayException $e) {
-            // No transaction yet: the payer has not submitted the hosted form.
-            if (in_array($e->httpStatus, [400, 404], true)) {
-                return Snapshot::status(PaymentStatus::RequiresAction);
+        $body = $this->verifyById($payment);
+
+        if ($body === null) {
+            try {
+                $body = $this->call('get', '/v3/transactions/verify_by_reference', ['tx_ref' => $payment->reference]);
+            } catch (GatewayException $e) {
+                // No transaction yet: the payer has not submitted the hosted form.
+                if (in_array($e->httpStatus, [400, 404], true) && ! $e instanceof GatewayUnavailable) {
+                    return Snapshot::status(PaymentStatus::RequiresAction);
+                }
+
+                throw $e;
             }
 
-            throw $e;
+            if ((string) data_get($body, 'data.tx_ref') !== $payment->reference) {
+                throw new GatewayException("[{$this->name}] the verification answer is for another transaction.", $this->name, body: $body);
+            }
         }
 
         $data = (array) ($body['data'] ?? []);
@@ -95,6 +110,30 @@ class FlutterwaveGateway extends AbstractGateway
         );
     }
 
+    /**
+     * @return array<string, mixed>|null null when no id is known or it is not this payment's
+     */
+    private function verifyById(Payment $payment): ?array
+    {
+        $id = $payment->gatewayValue('transaction_id') ?? $payment->provider_reference;
+
+        if (! is_scalar($id) || ! ctype_digit((string) $id)) {
+            return null;
+        }
+
+        try {
+            $body = $this->call('get', "/v3/transactions/{$id}/verify");
+        } catch (GatewayException $e) {
+            if ($e instanceof GatewayUnavailable) {
+                throw $e;
+            }
+
+            return null;
+        }
+
+        return (string) data_get($body, 'data.tx_ref') === $payment->reference ? $body : null;
+    }
+
     public function refund(Payment $payment, Refund $refund): RefundResult
     {
         $id = $payment->gatewayValue('transaction_id') ?? $payment->provider_reference;
@@ -108,6 +147,11 @@ class FlutterwaveGateway extends AbstractGateway
 
     public function fetchRefund(Payment $payment, Refund $refund): RefundResult
     {
+        // The refund request never answered; there is no lookup by our id.
+        if ($refund->provider_reference === null) {
+            return new RefundResult(RefundStatus::Pending);
+        }
+
         $body = $this->call('get', '/v3/refunds/'.$refund->provider_reference);
 
         return $this->mapRefund((array) ($body['data'] ?? []), $body);

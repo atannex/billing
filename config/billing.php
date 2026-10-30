@@ -63,6 +63,10 @@ return [
     |
     */
 
+    // The `fake` driver settles payments without any provider. It refuses
+    // to run in production unless this is set.
+    'allow_fake_in_production' => env('BILLING_ALLOW_FAKE_IN_PRODUCTION', false),
+
     'gateways' => [
 
         'stripe' => [
@@ -209,11 +213,18 @@ return [
     | billing:reconcile every minute from the package; turn it off if you
     | schedule the command yourself.
     |
+    | A payment closed here rather than by the provider (expired, or
+    | cancelled at a gateway that cannot call it off) may still be approved
+    | on the payer's phone. It is checked every `grace_every` seconds for
+    | `grace` minutes more, so a late success still lands. 0 turns it off.
+    |
     */
 
     'reconcile' => [
         'schedule' => true,
         'backoff' => [10, 20, 30, 60, 120, 300, 600, 1800, 3600],
+        'grace' => 1440,
+        'grace_every' => 900,
         'queue' => env('BILLING_QUEUE'),     // null runs checks inline
         'batch' => 200,
     ],
