@@ -7,11 +7,3 @@ Takes payments in a Laravel app. One simple API works with Stripe, MTN Mobile Mo
 ```bash
 composer require atannex/billing
 ```
-
-## Documentation
-
-The full guide is in [docs/README.md](docs/README.md).
-
-## License
-
-MIT.
