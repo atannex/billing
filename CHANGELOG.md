@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.2.0 (unreleased)
+
+### Added
+
+- Laravel 13 support: `illuminate/*` `^13.0` and `orchestra/testbench` `^11.0` are allowed, and CI runs Laravel 13 and PHP 8.5.
+
 ## v1.1.0 (2026-10-30)
 
 ### Fixed
